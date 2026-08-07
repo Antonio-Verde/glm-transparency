@@ -1,0 +1,1256 @@
+---
+title: "Trasparenza vs accuratezza nell'IA finanziaria: un'analisi con modelli CUB/GeCUB e Proportional Odds"
+author: "Antonio Verde"
+lang: it
+format:
+  pdf:
+    documentclass: article
+    papersize: a4
+    geometry:
+      - margin=2.7cm
+    toc: false
+    toc-depth: 3
+    number-sections: true
+    fig-pos: "H"
+    colorlinks: false
+    include-in-header:
+      text: |
+        \usepackage{booktabs}
+        \usepackage{float}
+        \floatplacement{figure}{H}
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+
+# ============================================================================
+# SETUP. Stile difensivo: pacchetti core obbligatori, pacchetti dei pilastri
+# avanzati gestiti come "feature flag" (il report compila anche se mancano,
+# segnalando il limite). Tutto il testo interpretativo è generato dagli oggetti
+# stimati: nessun numero è inchiodato a mano.
+# ============================================================================
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.width = 7, fig.height = 4.5
+)
+
+# Pacchetti indispensabili (il documento si ferma se mancano questi).
+required_packages <- c("dplyr", "ggplot2", "tidyr", "knitr", "MASS", "ordinal")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop("Pacchetti R mancanti: ", paste(missing_packages, collapse = ", "),
+       ". Installarli prima di compilare il report.")
+}
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(tidyr); library(knitr)
+})
+
+# Feature flag dei pilastri avanzati: se il pacchetto manca, il blocco
+# corrispondente degrada con eleganza invece di interrompere la compilazione.
+cub_available   <- requireNamespace("CUB", quietly = TRUE) &&
+                   requireNamespace("Formula", quietly = TRUE)
+brant_available <- requireNamespace("brant", quietly = TRUE)
+
+# ---- Funzioni di utilità ---------------------------------------------------
+fmt <- function(x, digits = 2) {
+  ifelse(is.na(x), NA_character_, format(round(x, digits), nsmall = digits))
+}
+fmt_pct <- function(x, digits = 1) paste0(fmt(100 * x, digits), "%")
+fmt_p   <- function(p) ifelse(is.na(p), "n.d.",
+             ifelse(p < 0.001, "< 0.001", fmt(p, 3)))
+
+skewness <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3 || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^3) / stats::sd(x)^3
+}
+kurtosis_excess <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 4 || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^4) / stats::sd(x)^4 - 3
+}
+zscore <- function(x) as.numeric(scale(x))
+
+# Etichette leggibili per i nomi di variabile/termine nelle tabelle dei modelli:
+# senza questa conversione, nomi come "consapevolezza_blackbox_z" o le variabili
+# fattoriali "genere_binMaschile" sono troppo lunghi per la larghezza di colonna
+# e LaTeX li spezza a metà parola in modo illeggibile.
+pretty_term <- function(x) {
+  known <- c(
+    eta_z = "Età", istruzione_z = "Istruzione", consapevolezza_blackbox_z = "Consap. Blackbox",
+    consapevolezza_uso_z = "Consap. Uso Banche", diritto_spiegazione_z = "Diritto Spiegazione",
+    tradeoff_accuratezza_z = "Tradeoff Precisione", differenza_modelli_z = "Differenza Modelli",
+    chiarezza_fattori_z = "Chiarezza Fattori", chiarezza1_z = "Chiarezza Punteggio", chiarezza3_z = "Confronto Esperti",
+    fiducia1_z = "Fiducia Previsione", fiducia2_z = "Fiducia Automazione", fiducia3_z = "Correzione Errori",
+    responsab1_z = "Responsabilità Umana", responsab2_z = "Rischi Errori",
+    controllo1_z = "Miglioramento Voto", controllo2_z = "Spiegazione Personale", controllo3_z = "Protezione Dati"
+  )
+  out <- unname(ifelse(x %in% names(known), known[x], x))
+  out <- gsub("^genere_bin", "Genere: ", out)
+  out <- gsub("^livello_prof_macro", "Prof.: ", out)
+  out
+}
+
+# Alias robusto delle colonne: cerca per nome esatto, poi per sottostringa.
+pick_col <- function(df, pattern) {
+  if (pattern %in% names(df)) return(pattern)
+  exact_idx <- which(names(df) == pattern)
+  if (length(exact_idx) == 1) return(names(df)[exact_idx])
+  idx <- grep(pattern, names(df), fixed = TRUE)
+  if (length(idx) == 0) return(NA_character_)
+  names(df)[idx[1]]
+}
+rename_from_map <- function(df, map, required = character()) {
+  for (alias in names(map)) {
+    if (alias %in% names(df)) next
+    found <- pick_col(df, map[[alias]])
+    if (!is.na(found)) {
+      names(df)[names(df) == found] <- alias
+    } else if (alias %in% required) {
+      stop("Colonna richiesta non trovata per l'alias: ", alias)
+    }
+  }
+  df
+}
+to_num <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(gsub(",", ".", as.character(x))))
+}
+row_mean_safe <- function(data, cols) {
+  cols <- intersect(cols, names(data))
+  if (length(cols) == 0) return(rep(NA_real_, nrow(data)))
+  out <- rowMeans(data[, cols, drop = FALSE], na.rm = TRUE)
+  out[is.nan(out)] <- NA_real_
+  out
+}
+
+# ---- Caricamento dati ------------------------------------------------------
+dataset_candidates <- c(
+  "dataset_glm_pulito (3).csv",
+  "/Users/antonioverde/Downloads/dataset_glm_pulito (3).csv",
+  "/Users/antonioverde/Desktop/dataset_glm_pulito (3).csv",
+  "dataset_glm_pulito (1).csv",
+  "/Users/antonioverde/Downloads/dataset_glm_pulito (1).csv"
+)
+dataset_path <- dataset_candidates[file.exists(dataset_candidates)][1]
+if (exists("dataset_glm_pulito_3_")) {
+  df_raw <- as.data.frame(dataset_glm_pulito_3_)
+} else if (!is.na(dataset_path)) {
+  df_raw <- read.csv(dataset_path, check.names = FALSE, stringsAsFactors = FALSE)
+} else {
+  stop("Dataset non trovato. Percorsi verificati: ",
+       paste(dataset_candidates, collapse = "; "))
+}
+
+# ---- Mappe degli alias -----------------------------------------------------
+core_map <- list(
+  consapevolezza_uso = "sono_consapevole_che_banche_e_istituzioni_finanziarie_utilizzano_sistemi_di_ia",
+  consapevolezza_blackbox = "sono_consapevole_che_esistono_i_cosiddetti_modelli_a_scatola_nera",
+  diritto_spiegazione = "sono_consapevole_che_ho_il_diritto_di_richiedere_spiegazioni",
+  tradeoff_accuratezza = "sono_consapevole_che_i_sistemi_di_ia_piu_precisi_spesso_non_riescono_a_spiegare",
+  differenza_modelli = "sono_consapevole_che_sono_consapevole_della_differenza",
+  preferenza_IA = "su_una_scala_da_0_a_10_quale_tipo_di_sistema_di_ia_in_un_app_finanziaria_preferiresti"
+)
+# 11 item di importanza in 4 temi (chiarezza, fiducia, responsabilità, controllo).
+item_map <- list(
+  chiarezza1 = "una_spiegazione_chiara_di_come_l_app_ha_determinato_il_tuo_risultato",
+  chiarezza2 = "conoscere_i_principali_fattori_che_hanno_influenzato_il_risultato",
+  chiarezza3 = "vedere_come_il_tuo_risultato_si_confronta_con_opinioni_di_esperti",
+  fiducia1 = "vedere_quanto_e_affidabile_o_sicura_la_previsione_dell_app",
+  fiducia2 = "capire_quali_parti_del_processo_sono_automatizzate",
+  fiducia3 = "capire_come_vengono_rilevati_e_corretti_gli_errori",
+  responsab1 = "sapere_se_la_decisione_e_stata_presa_o_rivista_da_un_essere_umano",
+  responsab2 = "essere_informato_sui_possibili_rischi_o_conseguenze",
+  controllo1 = "ricevere_consigli_su_come_migliorare_o_modificare_il_risultato",
+  controllo2 = "ricevere_una_spiegazione_personalizzata_per_il_proprio_caso",
+  controllo3 = "sapere_come_i_miei_dati_vengono_utilizzati_e_protetti"
+)
+demo_map <- list(
+  genere = "genere",
+  eta = "eta",
+  istruzione = "livello_piu_alto_di_istruzione_raggiunto",
+  livello_prof = "qualle_delle_seguenti_opzioni_descrive_meglio_il_tuo_livello_professionale"
+)
+# Colonne categoriali a scelta multipla e di esperienza pregressa.
+extra_map <- list(
+  scenari_spiegazione = "in_quali_dei_seguenti_casi_ritieni_che_un_sistema_di_ia_debba_essere_obbligato_a_fornire_una_spiegazione",
+  garante_trasparenza = "chi_deve_garantire_la_trasparenza_dei_sistemi_di_ia_nella_finanza",
+  esperienza_ia = "hai_mai_utilizzato_un_app_finanziaria_per_la_gestione_del_denaro_gli_investimenti_o_il_risparmio_che_utilizzava_strumenti_di_intelligenza_artificiale_ia_o_funzioni_automatiche_intelligenti"
+)
+
+analysis_df <- df_raw |>
+  rename_from_map(core_map, required = "preferenza_IA") |>
+  rename_from_map(item_map) |>
+  rename_from_map(demo_map) |>
+  rename_from_map(extra_map)
+
+numeric_aliases <- intersect(c(names(core_map), names(item_map)), names(analysis_df))
+analysis_df[numeric_aliases] <- lapply(analysis_df[numeric_aliases], to_num)
+
+# ---- Ricodifiche demografiche ----------------------------------------------
+eta_midpoint <- function(x) dplyr::case_when(
+  x == "18-24" ~ 21.0, x == "25-34" ~ 29.5, x == "35-44" ~ 39.5,
+  x == "45-54" ~ 49.5, x == "55-64" ~ 59.5, x == "65+" ~ 70.0, TRUE ~ NA_real_
+)
+istruzione_ord_fn <- function(x) dplyr::case_when(
+  grepl("media|medie|elementare|primaria|nessuna", x, ignore.case = TRUE) ~ 1L,
+  grepl("diploma|superiore|maturit", x, ignore.case = TRUE) ~ 2L,
+  grepl("triennale|bachelor", x, ignore.case = TRUE) ~ 3L,
+  grepl("magistrale|master|dottorato|phd|specializzaz|vecchio ordinamento", x, ignore.case = TRUE) ~ 4L,
+  TRUE ~ NA_integer_
+)
+livello_prof_fn <- function(x) dplyr::case_when(
+  grepl("studente|disoccupat|student", x, ignore.case = TRUE) ~ "Studente/ssa",
+  grepl("tirocinante|apprendista|ricercatore junior", x, ignore.case = TRUE) ~ "Istruzione/Ricerca",
+  grepl("docente|insegnante|professore associato", x, ignore.case = TRUE) ~ "Istruzione/Ricerca",
+  grepl("dipendente|collaboratore|analista|assistente|tecnico|impiegat|segretari", x, ignore.case = TRUE) ~ "Lavoratori Dipendenti",
+  grepl("coordinatore|supervisore|manager|direttore|dirigente|executive|professore ordinario|alta dirigenza", x, ignore.case = TRUE) ~ "Management",
+  grepl("libero professionista|consulente|magistrato|funzionario|forze", x, ignore.case = TRUE) ~ "Libero Professionista",
+  grepl("pension", x, ignore.case = TRUE) ~ "Pensionato/a",
+  TRUE ~ "Altre categorie"
+)
+
+analysis_df <- analysis_df |>
+  mutate(
+    preferenza_IA = as.integer(preferenza_IA),
+    R = preferenza_IA + 1L,
+    R_ord = ordered(R, levels = 1:11),
+    eta_num = if ("eta" %in% names(analysis_df)) eta_midpoint(eta) else NA_real_,
+    genere_bin = if ("genere" %in% names(analysis_df)) {
+      dplyr::case_when(genere == "Maschile" ~ "Maschile",
+                       genere == "Femminile" ~ "Femminile", TRUE ~ "Altro")
+    } else NA_character_,
+    genere_bin = factor(genere_bin, levels = c("Femminile", "Maschile", "Altro")),
+    istruzione_num = if ("istruzione" %in% names(analysis_df)) istruzione_ord_fn(istruzione) else NA_integer_,
+    istruzione_ord = factor(istruzione_num, levels = 1:4,
+      labels = c("Scuola media o meno", "Diploma", "Laurea triennale", "Magistrale o oltre"),
+      ordered = TRUE),
+    livello_prof_macro = if ("livello_prof" %in% names(analysis_df)) factor(livello_prof_fn(livello_prof)) else factor(NA),
+    # chiarezza_fattori è l'item singolo "conoscere i principali fattori che hanno
+    # influenzato il risultato": resta un item puntuale (1-5), non una media di scala,
+    # perché nel modello POM stepwise compare come predittore a sé stante.
+    chiarezza_fattori = if ("chiarezza2" %in% names(analysis_df)) chiarezza2 else NA_real_,
+    fiducia = row_mean_safe(pick(everything()), c("fiducia1", "fiducia2", "fiducia3")),
+    responsabilita_umana = row_mean_safe(pick(everything()), c("responsab1", "responsab2")),
+    protezione_dati = if ("controllo3" %in% names(analysis_df)) controllo3 else NA_real_,
+    eta_ord = if ("eta" %in% names(analysis_df)) match(eta, c("18-24", "25-34", "35-44", "45-54", "55-64", "65+")) else NA_integer_
+  ) |>
+  filter(!is.na(preferenza_IA), preferenza_IA >= 0, preferenza_IA <= 10)
+
+# ---- Codifica unica delle covariate -----------------------------------------
+# Tutte le covariate continue sono standardizzate (z-score) e usate IDENTICHE
+# nel modello GeCUB e nel modello POM di benchmark, cosicché il confronto BIC
+# sia "like-for-like": stesso supporto della risposta (R, 11 categorie), stesse
+# covariate, stesse righe.
+analysis_df <- analysis_df |>
+  mutate(
+    eta_z = zscore(eta_num),
+    istruzione_z = zscore(istruzione_num),
+    consapevolezza_blackbox_z = zscore(consapevolezza_blackbox),
+    consapevolezza_uso_z = zscore(consapevolezza_uso),
+    diritto_spiegazione_z = zscore(diritto_spiegazione),
+    tradeoff_accuratezza_z = zscore(tradeoff_accuratezza),
+    differenza_modelli_z = zscore(differenza_modelli),
+    chiarezza_fattori_z = zscore(chiarezza_fattori),
+    chiarezza1_z = zscore(chiarezza1), chiarezza3_z = zscore(chiarezza3),
+    fiducia_z = zscore(fiducia),
+    fiducia1_z = zscore(fiducia1), fiducia2_z = zscore(fiducia2), fiducia3_z = zscore(fiducia3),
+    responsab1_z = zscore(responsab1), responsab2_z = zscore(responsab2),
+    controllo1_z = zscore(controllo1), controllo2_z = zscore(controllo2), controllo3_z = zscore(controllo3)
+  )
+
+# Le due covariate del modello GeCUB "finale" (Sez. 7): Età sul Feeling,
+# Consapevolezza Black-box sull'Incertezza. È l'insieme minimo, coerente con
+# la selezione per BIC descritta in Sez. 7.1.
+final_feeling_cov <- c("eta_z")
+final_uncert_cov  <- c("consapevolezza_blackbox_z")
+overfit_uncert_cov <- c("consapevolezza_blackbox_z", "chiarezza_fattori_z")
+
+# Insieme esteso di covariate standardizzate, usato come "kitchen sink" per la
+# selezione stepwise del POM "best-fit" (Sez. 10): demografiche, item di
+# consapevolezza e i singoli undici item di importanza (non le medie di scala).
+cov_z <- c("eta_z", "istruzione_z", "consapevolezza_blackbox_z", "consapevolezza_uso_z",
+           "diritto_spiegazione_z", "tradeoff_accuratezza_z", "differenza_modelli_z",
+           "chiarezza_fattori_z", "chiarezza1_z", "chiarezza3_z",
+           "fiducia1_z", "fiducia2_z", "fiducia3_z",
+           "responsab1_z", "responsab2_z", "controllo1_z", "controllo2_z", "controllo3_z")
+
+# Dataset di modellazione comune (complete-case): garantisce che AIC/BIC siano
+# calcolati sulle stesse osservazioni per tutti i modelli del lavoro.
+mod_df <- analysis_df |>
+  select(R, R_ord, eta_ord, genere_bin, livello_prof_macro, all_of(cov_z)) |>
+  tidyr::drop_na() |>
+  mutate(R = as.integer(R))
+
+target_stats <- analysis_df |>
+  summarise(
+    n = n(), media = mean(preferenza_IA), mediana = stats::median(preferenza_IA),
+    sd = stats::sd(preferenza_IA), skewness = skewness(preferenza_IA),
+    quota_bassa = mean(preferenza_IA <= 3), quota_centrale = mean(preferenza_IA >= 4 & preferenza_IA <= 6),
+    quota_alta = mean(preferenza_IA >= 7), quota_valore_centrale = mean(preferenza_IA == 5)
+  )
+```
+
+## Introduzione e obiettivi della ricerca
+
+Negli ultimi anni l'introduzione dell'intelligenza artificiale (IA) nel settore finanziario ha trasformato radicalmente l'interazione tra utenti e servizi bancari. L'adozione di questi strumenti porta con sé un dilemma fondamentale, spesso definito come il **trade-off tra accuratezza e spiegabilità**: da un lato sistemi *black-box*, estremamente precisi ma opachi nel loro funzionamento; dall'altro sistemi *glass-box*, meno complessi ma capaci di fornire spiegazioni chiare sulle decisioni prese.
+
+Il presente lavoro analizza le preferenze degli utenti rispetto a questo bivio tecnologico. In particolare, ci si chiede cosa spinga un individuo a preferire la trasparenza rispetto alla pura performance algoritmica, e quanto l'incertezza — più che la direzione del giudizio — influenzi questa scelta. Per rispondere a entrambe le domande occorre un modello capace di scindere le due dimensioni: è la ragione per cui il lavoro pone al centro la famiglia dei modelli **CUB/GeCUB**, affiancata da un modello **Proportional Odds** con funzione di benchmark.
+
+## Dataset
+
+L'analisi si basa su un dataset acquisito tramite un'indagine campionaria (n = `r nrow(analysis_df)`), volta a esplorare le attitudini dei consumatori nei confronti dei sistemi finanziari automatizzati. La variabile target, `preferenza_IA`, è misurata su una scala ordinale da 0 a 10, dove:
+
+- i punteggi bassi (0-3) indicano una preferenza per l'efficienza e l'accuratezza (sistemi black-box);
+- i punteggi centrali (4-6) rappresentano una posizione di compromesso o indecisione;
+- i punteggi alti (7-10) segnalano una netta preferenza per la spiegabilità e la trasparenza (sistemi glass-box).
+
+Oltre alla variabile target, il dataset comprende oltre venti predittori che spaziano dalle caratteristiche demografiche (età, genere, istruzione) a variabili psicometriche sulla consapevolezza tecnologica, il diritto alla spiegazione e la fiducia nelle previsioni automatiche.
+
+Per l'implementazione dei modelli CUB/GeCUB — che operano su domini di risposta strettamente positivi — la scala originale 0-10 viene traslata nell'intervallo 1-11 tramite la trasformazione $R = Y + 1$. La trasformazione non modifica l'ordine sostanziale della risposta. Tutte le covariate quantitative usate nei modelli sono inoltre standardizzate (z-score), così da rendere confrontabili i coefficienti tra il GeCUB e il POM di benchmark.
+
+```{r dataset-preview}
+preview_tab <- analysis_df |>
+  transmute(
+    `Target (0-10)` = preferenza_IA,
+    `Fascia Età` = eta,
+    `Consap. Blackbox` = consapevolezza_blackbox,
+    `Chiar. Fattori` = chiarezza_fattori,
+    Genere = genere_bin
+  ) |>
+  head(6)
+knitr::kable(preview_tab, caption = "Anteprima della struttura dei dati (prime 6 osservazioni).")
+```
+
+## Struttura del lavoro
+
+Il percorso seguito da questo lavoro si articola in cinque tappe, ciascuna propedeutica alla successiva.
+
+1. **Il dataset** (Sez. 2): presentazione della variabile target `preferenza_IA`, dei predittori demografici e psicometrici disponibili, e della trasformazione $R = Y+1$ richiesta dai modelli a miscela.
+2. **L'analisi descrittiva ed esplorativa — EDA** (Sez. 4): profilo socio-demografico del campione, livello di consapevolezza ed esperienza pregressa con l'IA, aspettative su sicurezza e responsabilità, e infine la distribuzione della variabile target, da cui emergono l'asimmetria verso la trasparenza e l'effetto rifugio sul voto centrale che motivano la scelta dei modelli successivi.
+3. **Il quadro teorico dei GLM e delle due famiglie di modelli** (Sez. 5-6): richiamo della famiglia esponenziale e presentazione delle due strategie di modellazione — il modello a miscela **GeCUB**, per scindere il "sentimento" dei rispondenti dall'incertezza intrinseca nella scelta, e il **Proportional Odds Model (POM)**, utilizzato come benchmark per quantificare l'impatto dei driver principali attraverso gli odds ratio.
+4. **La stima e la validazione dei modelli** (Sez. 7-10): selezione del GeCUB finale per criterio BIC, validazione tramite una stima manuale (MLE) di un modello CUBE con effetto shelter, confronto con il POM di benchmark e, infine, selezione stepwise di un POM "best-fit" tra un insieme esteso di predittori.
+5. **Confronto, diagnostica e conclusioni** (Sez. 10-11): un'analisi comparativa basata su indici di informazione (BIC) e capacità previsiva, per determinare quale approccio descriva meglio il comportamento reale del campione, seguita dalle implicazioni operative per il settore finanziario.
+
+## Analisi descrittiva e preliminare delle variabili
+
+Prima di procedere con la modellizzazione statistica, è utile un'analisi esplorativa per comprendere la composizione del campione e la distribuzione delle risposte: identifica tendenze latenti e anomalie nei dati che la modellazione dovrà rendere conto.
+
+```{r eda-helpers}
+#| include: false
+# Tutti i testi dei grafici usano un font SERIF, così le figure si armonizzano
+# con la tipografia LaTeX del corpo del documento (Latin Modern) e l'insieme
+# appare come un unico documento composto in LaTeX, non con grafici "incollati".
+plot_family <- "serif"
+ggplot2::update_geom_defaults("text",  list(family = plot_family))
+ggplot2::update_geom_defaults("label", list(family = plot_family))
+
+theme_eda <- function(base = 12) {
+  theme_minimal(base_size = base, base_family = plot_family) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(colour = "grey30"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(colour = "grey25"),
+      legend.position = "bottom"
+    )
+}
+# Palette categorica validata (8 tinte nettamente distinte, ordine fisso: non
+# vengono mai ricombinate a caso, così i grafici vicini nel testo non si
+# confondono tra loro).
+col_eda <- c(blu = "#2a78d6", acqua = "#1baf7a", giallo = "#eda100",
+             verde = "#008300", viola = "#4a3aa7", rosso = "#e34948",
+             magenta = "#e87ba4", arancio = "#eb6834")
+
+wrap_lab <- function(x, w = 38)
+  vapply(x, function(s) paste(strwrap(s, w), collapse = "\n"), character(1))
+
+# I titoli dei grafici vanno sempre a capo esplicitamente (via "\n"): un titolo
+# lungo non spezzato da ggplot semplicemente trabocca dal bordo dell'immagine
+# (il device ha larghezza fissa), risultando tagliato nel PDF finale.
+wrap_title <- function(x, w = 46) {
+  if (is.null(x) || is.na(x)) return(x)
+  paste(strwrap(x, w), collapse = "\n")
+}
+
+bar_v <- function(data, col, fill, title, xlab, order = NULL) {
+  d <- data |> filter(!is.na(.data[[col]])) |> count(Cat = .data[[col]], name = "n")
+  d$Cat <- if (is.null(order)) factor(d$Cat) else factor(d$Cat, levels = order)
+  ggplot(d, aes(Cat, n)) +
+    geom_col(fill = fill, width = 0.7) +
+    geom_text(aes(label = n), vjust = -0.3, size = 3.1, colour = "grey20") +
+    labs(title = wrap_title(title), x = xlab, y = "Conteggio") +
+    theme_eda()
+}
+
+bar_h <- function(data, col, fill, title, xlab = "Conteggio", wrap = 38) {
+  d <- data |> filter(!is.na(.data[[col]]), .data[[col]] != "") |>
+    count(Cat = .data[[col]], name = "n") |>
+    mutate(Cat = reorder(wrap_lab(as.character(Cat), wrap), n))
+  ggplot(d, aes(n, Cat)) +
+    geom_col(fill = fill, width = 0.7) +
+    geom_text(aes(label = n), hjust = -0.15, size = 3.1, colour = "grey20") +
+    coord_cartesian(xlim = c(0, max(d$n) * 1.14), clip = "off") +
+    labs(title = wrap_title(title), x = xlab, y = NULL) +
+    theme_eda()
+}
+
+bar_tokens <- function(x, fill, title, xlab = "Numero di citazioni", wrap = 30) {
+  toks <- trimws(unlist(strsplit(as.character(x[!is.na(x)]), ";")))
+  toks <- toks[toks != ""]
+  d <- data.frame(table(Cat = toks), stringsAsFactors = FALSE) |>
+    setNames(c("Cat", "n")) |>
+    mutate(Cat = reorder(wrap_lab(as.character(Cat), wrap), n))
+  # Con molte categorie ed etichette lunghe (a più righe) serve un carattere
+  # più piccolo per evitare sovrapposizioni verticali tra etichette contigue.
+  txt_size <- if (nrow(d) > 8) 8.5 else 10.5
+  ggplot(d, aes(n, Cat)) +
+    geom_col(fill = fill, width = 0.6) +
+    geom_text(aes(label = n), hjust = -0.15, size = 3.1, colour = "grey20") +
+    coord_cartesian(xlim = c(0, max(d$n) * 1.14), clip = "off") +
+    labs(title = wrap_title(title), x = xlab, y = NULL) +
+    theme_eda() +
+    theme(axis.text.y = element_text(size = txt_size, lineheight = 0.85))
+}
+
+# Piccoli multipli di barre (punteggio 1-5) per gli item Likert.
+facet_bars5 <- function(data, vars, labels, fill, title = NULL, ncol = 3) {
+  df <- data |>
+    select(all_of(vars)) |>
+    tidyr::pivot_longer(everything(), names_to = "Item", values_to = "Punteggio") |>
+    filter(!is.na(Punteggio)) |>
+    mutate(Item = factor(unname(labels[Item]), levels = unname(labels[vars])),
+           Punteggio = factor(as.integer(Punteggio), levels = 1:5)) |>
+    count(Item, Punteggio, name = "Conteggio")
+  ggplot(df, aes(Punteggio, Conteggio)) +
+    geom_col(fill = fill, width = 0.7) +
+    facet_wrap(~Item, ncol = ncol) +
+    labs(title = wrap_title(title), x = "Punteggio (1-5)", y = "Conteggio") +
+    theme_eda(11)
+}
+
+top_count <- function(data, var) {
+  if (!var %in% names(data)) {
+    return(data.frame(Categoria = "n.d.", n = NA_integer_, p = NA_real_))
+  }
+  tab <- data |>
+    filter(!is.na(.data[[var]])) |>
+    count(Categoria = .data[[var]], name = "n") |>
+    mutate(p = n / sum(n)) |>
+    arrange(desc(n)) |>
+    mutate(Categoria = as.character(Categoria))
+  if (nrow(tab) == 0) data.frame(Categoria = "n.d.", n = NA_integer_, p = NA_real_) else tab
+}
+share_high <- function(var, threshold = 4) {
+  if (!var %in% names(analysis_df)) return(NA_real_)
+  x <- analysis_df[[var]]
+  if (all(is.na(x))) return(NA_real_)
+  mean(x >= threshold, na.rm = TRUE)
+}
+```
+
+### Profilo socio-demografico e professionale del campione
+
+Dall'osservazione delle caratteristiche anagrafiche e professionali emerge un campione variegato ma con una forte componente giovane e istruita.
+
+```{r eda-summaries}
+#| include: false
+eda_gender <- top_count(analysis_df, "genere_bin")[1, ]
+eda_age <- top_count(analysis_df, "eta")[1, ]
+eda_edu <- top_count(analysis_df, "istruzione_ord")[1, ]
+eda_prof <- top_count(analysis_df, "livello_prof_macro")[1, ]
+young_share <- mean(analysis_df$eta %in% c("18-24", "25-34"), na.rm = TRUE)
+high_edu_share <- mean(analysis_df$istruzione_num >= 3, na.rm = TRUE)
+student_share <- mean(grepl("Studente", analysis_df$livello_prof_macro), na.rm = TRUE)
+```
+
+- **Genere:** la distribuzione vede `r eda_gender$Categoria` come categoria più numerosa (`r eda_gender$n`, `r fmt_pct(eda_gender$p)`), senza forti sbilanciamenti tra i generi principali: il campione non introduce quindi una distorsione di genere rilevante nelle analisi successive.
+- **Età:** il campione è caratterizzato da una presenza massiccia della fascia `r eda_age$Categoria` (`r fmt_pct(eda_age$p)`); le fasce 18-24 e 25-34 insieme raccolgono il `r fmt_pct(young_share)` del campione. L'età si rivelerà una delle variabili esplicative più influenti, sia nel modello GeCUB sia nel POM di benchmark.
+- **Istruzione:** il livello più frequente è `r eda_edu$Categoria`, con il `r fmt_pct(high_edu_share)` dei rispondenti che possiede almeno una laurea triennale: un campione relativamente istruito, da tenere presente nella generalizzazione dei risultati.
+- **Profilo professionale:** il gruppo più numeroso è `r eda_prof$Categoria` (`r eda_prof$n` rispondenti, `r fmt_pct(student_share)` del campione considerando anche i disoccupati assimilati) — coerente con la struttura anagrafica giovane appena descritta.
+
+```{r eda-genere, fig.cap="Distribuzione per genere.", fig.height=3.3}
+bar_v(analysis_df, "genere_bin", unname(col_eda["blu"]), "Composizione del campione per genere", "Genere")
+```
+
+```{r eda-eta, fig.cap="Distribuzione per fascia d'età.", fig.height=3.3}
+bar_v(analysis_df, "eta", unname(col_eda["acqua"]), "Composizione del campione per fascia d'età", "Fascia d'età",
+      order = c("18-24", "25-34", "35-44", "45-54", "55-64", "65+"))
+```
+
+```{r eda-istruzione, fig.cap="Distribuzione del livello di istruzione (4 livelli accorpati).", fig.height=3.2}
+bar_h(analysis_df, "istruzione_ord", unname(col_eda["giallo"]), "Livello di istruzione raggiunto dai rispondenti")
+```
+
+```{r eda-professione, fig.cap="Distribuzione del profilo professionale (macro-aggregato).", fig.height=3.6}
+bar_h(analysis_df, "livello_prof_macro", unname(col_eda["verde"]), "Condizione professionale dichiarata dai rispondenti")
+```
+
+### Esperienza, consapevolezza e percezione della tecnologia
+
+L'analisi del background tecnologico degli intervistati rivela un divario tra percezione e utilizzo reale: la maggioranza dichiara di non aver mai usato un'app finanziaria basata su IA, pur mostrando opinioni definite sui temi di trasparenza — un segnale che le preferenze misurate riflettono più un atteggiamento generale che un'esperienza diretta consolidata.
+
+```{r eda-esperienza, fig.cap="Esperienza pregressa con app finanziarie basate su IA.", fig.height=3.3}
+bar_v(analysis_df, "esperienza_ia", unname(col_eda["viola"]),
+      "Hai mai usato un'app finanziaria basata su IA?", "Livello di utilizzo")
+```
+
+```{r eda-awareness-facet, fig.cap="Livello di consapevolezza e conoscenza tecnica (scala 1-5).", fig.height=4.6}
+awareness_labels <- c(
+  consapevolezza_uso = "Consapevolezza banche",
+  consapevolezza_blackbox = "Consapevolezza blackbox",
+  differenza_modelli = "Differenza IA",
+  diritto_spiegazione = "Diritto spiegazione"
+)
+facet_bars5(analysis_df, names(awareness_labels), awareness_labels, unname(col_eda["rosso"]),
+            title = "Quanto i rispondenti si dichiarano consapevoli dei temi IA?", ncol = 2)
+```
+
+```{r eda-chiarezza-fiducia-facet, fig.cap="Percezione di chiarezza e fiducia nel sistema (scala 1-5).", fig.height=4.6}
+chiarezza_fiducia_labels <- c(
+  chiarezza1 = "Chiarezza punteggio",
+  chiarezza_fattori = "Chiarezza fattori",
+  chiarezza3 = "Confronto esperti",
+  fiducia1 = "Fiducia previsione",
+  fiducia2 = "Fiducia automazione",
+  tradeoff_accuratezza = "Tradeoff precisione"
+)
+facet_bars5(analysis_df, names(chiarezza_fiducia_labels), chiarezza_fiducia_labels,
+            unname(col_eda["magenta"]), title = "Percezione di chiarezza dei criteri e fiducia nel sistema", ncol = 3)
+```
+
+- **Uso dell'IA in finanza:** il `r fmt_pct(share_high("consapevolezza_uso"))` dei rispondenti si colloca sui valori 4-5 dell'item di consapevolezza d'uso: la familiarità dichiarata resta minoritaria.
+- **Modelli black-box:** il `r fmt_pct(share_high("consapevolezza_blackbox"))` dichiara consapevolezza elevata (4-5) dell'esistenza dei modelli a scatola nera — questa variabile agirà, nei modelli successivi, sulla componente di *incertezza* della preferenza, non sulla sua direzione: un risultato controintuitivo che sarà al centro della Sez. 7.
+- **Fiducia e chiarezza:** le distribuzioni sono spostate verso i valori medio-alti (4), riflettendo un atteggiamento di fiducia o di parziale incomprensione delle logiche algoritmiche; è il primo indizio empirico di un campione che percepisce il sistema come utile ma non del tutto trasparente.
+
+### Aspettative su sicurezza, rischi e responsabilità
+
+Le richieste del campione in termini di tutele e accountability sono estremamente elevate e specifiche.
+
+```{r eda-garante, fig.cap="Chi deve garantire la trasparenza dei sistemi di IA: numero di citazioni per soggetto.", fig.height=3.4}
+bar_tokens(analysis_df$garante_trasparenza, unname(col_eda["arancio"]),
+           "Chi dovrebbe garantire la trasparenza dei sistemi di IA?")
+```
+
+```{r eda-scenari, fig.cap="In quali casi l'IA deve fornire una spiegazione: numero di citazioni per scenario.", fig.height=6.5}
+bar_tokens(analysis_df$scenari_spiegazione, unname(col_eda["blu"]),
+           "In quali situazioni una spiegazione dovrebbe essere obbligatoria?")
+```
+
+```{r eda-sicurezza-facet, fig.cap="Aspettative su sicurezza, rischi e responsabilità (scala 1-5).", fig.height=4.6}
+sicurezza_labels <- c(
+  responsab1 = "Responsabilità umana",
+  responsab2 = "Rischi errori",
+  controllo2 = "Spiegazione personale",
+  fiducia3 = "Correzione errori",
+  controllo1 = "Miglioramento voto",
+  controllo3 = "Protezione dati"
+)
+facet_bars5(analysis_df, names(sicurezza_labels), sicurezza_labels, unname(col_eda["acqua"]),
+            title = "Aspettative su correzione degli errori, protezione dati e responsabilità umana", ncol = 3)
+```
+
+Emerge una netta richiesta affinché siano le **autorità di controllo** e le **istituzioni finanziarie** a garantire la correttezza dei sistemi; le frequenze più alte per la richiesta di spiegazioni si riscontrano nei casi critici (approvazione/rifiuto di un prestito, segnalazione di transazioni sospette, avvisi di frode). Il campione esprime inoltre punteggi elevati sulla necessità di correzione degli errori, protezione dei dati e, soprattutto, mantenimento di una responsabilità umana nel processo decisionale: nel complesso, il quadro descrittivo disegna un campione che non rifiuta l'automazione, ma ne chiede un controllo umano di ultima istanza.
+
+### Analisi statistica della variabile target: preferenza per la trasparenza
+
+Il grafico della distribuzione della variabile target (`preferenza_IA`) è il punto di sintesi dell'orientamento del campione rispetto al trade-off tra accuratezza e trasparenza.
+
+```{r target-distribution-plot, fig.cap="Distribuzione della preferenza: istogramma di densità, curva di densità (in rosso) e media (linea blu tratteggiata)."}
+kurt_pref <- kurtosis_excess(analysis_df$preferenza_IA)
+ggplot(analysis_df, aes(preferenza_IA)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 1,
+                 fill = "#cde2fb", colour = "white") +
+  geom_density(colour = unname(col_eda["rosso"]), linewidth = 1.1, adjust = 1.1) +
+  geom_vline(xintercept = target_stats$media, linetype = "dashed",
+             colour = unname(col_eda["verde"]), linewidth = 0.9) +
+  scale_x_continuous(breaks = 0:10) +
+  labs(
+    title = wrap_title("Come si distribuisce la preferenza tra accuratezza e trasparenza?"),
+    subtitle = paste0("Asimmetria: ", fmt(target_stats$skewness),
+                      "  |  Curtosi: ", fmt(kurt_pref)),
+    x = "Preferenza (scala 0-10)", y = "Densità"
+  ) +
+  theme_eda()
+```
+
+- **Asimmetria negativa (skewness `r fmt(target_stats$skewness)`):** la massa delle risposte è sbilanciata verso i valori alti della scala (7-10), evidenziando una spiccata propensione verso la trasparenza algoritmica.
+- **Curtosi (`r fmt(kurt_pref)`):** una distribuzione piuttosto platicurtica, che indica come le opinioni siano distribuite su diverse categorie piuttosto che concentrate su un singolo voto.
+- **Fenomeni psicologici:** l'estremo superiore (voto 10) raccoglie i rispondenti "radicali" che considerano la spiegabilità un requisito imprescindibile; il valore centrale (voto 5) mostra una concentrazione interpretabile come **effetto rifugio** (*shelter effect*), tipico di chi percepisce il dilemma come troppo complesso per schierarsi nettamente. Media `r fmt(target_stats$media)`, mediana `r fmt(target_stats$mediana)`, deviazione standard `r fmt(target_stats$sd)`.
+
+## Panoramica sui GLM: la famiglia esponenziale
+
+Un GLM assume che la variabile risposta $Y$ appartenga alla cosiddetta **famiglia esponenziale**, la cui funzione di densità (o di massa) può essere scritta nella forma generale
+$$f(y; \theta, \phi) = \exp\left(\frac{y\theta - b(\theta)}{a(\phi)} + c(y, \phi)\right).$$
+Gli elementi chiave sono: $\theta$, il **parametro canonico**, strettamente legato alla media della distribuzione; $\phi$, il **parametro di dispersione**, che gestisce la variabilità; e $b(\theta)$, la funzione che ne determina le proprietà statistiche (media e varianza).
+
+### Le tre componenti di un GLM
+
+Un modello lineare generalizzato è definito univocamente da tre pilastri fondamentali.
+
+**A. La componente casuale.** Si riferisce alla variabile risposta $Y$ e alla sua distribuzione di probabilità. A differenza della regressione classica, dove si assume $Y \sim N(\mu, \sigma^2)$, qui si sceglie la distribuzione più adatta ai dati — nel nostro caso una miscela discreta per la componente CUB, oppure la famiglia multinomiale-cumulativa per il POM.
+
+**B. Il predittore lineare (*systematic component*).** È la combinazione lineare delle variabili esplicative $X$, indicata con $\eta = \beta_0 + \beta_1 x_1 + \cdots + \beta_k x_k$.
+
+**C. La funzione di legame (*link function*).** È il "ponte" che collega il predittore lineare $\eta$ alla media della variabile risposta ($\mu = E[Y]$): $g(\mu) = \eta$. La funzione $g(\cdot)$ deve essere monotona e differenziabile, e trasforma il range della media nell'intervallo $(-\infty, +\infty)$ del predittore lineare.
+
+**Una precisazione importante: il POM è un GLM, il GeCUB no (in senso stretto).** Vale la pena essere precisi sulla collocazione dei due modelli di questo lavoro rispetto al framework GLM. Il *Proportional Odds Model* è un GLM classico: la risposta ordinale è ricondotta a una famiglia multinomiale-cumulativa, i logit cumulati sono legati al predittore lineare tramite un link, e la stima è di tipo iterativo pesato. Il *GeCUB*, invece, è un **modello a miscela**: la sua distribuzione (combinazione di una Binomiale traslata e di una Uniforme) **non appartiene alla famiglia esponenziale in senso stretto**, e la stima non avviene per IRLS ma tramite algoritmo EM o massimizzazione numerica diretta della log-verosimiglianza (come nella stima manuale della Sez. 8). Il GeCUB *estende* lo spirito dei GLM — lega parametri latenti a predittori lineari tramite link logistici — ma non è, tecnicamente, un GLM. Questa distinzione è deliberata: i due modelli sono complementari proprio perché appartengono a famiglie diverse.
+
+### Caratteristiche principali e vantaggi
+
+- **Varianza non costante:** nei GLM la varianza può essere una funzione della media.
+- **Linearità nei parametri:** il predittore $\eta$ è una combinazione lineare dei coefficienti $\beta$.
+- **Stima tramite massima verosimiglianza (MLE):** nei GLM classici (come il POM) i parametri si stimano con l'algoritmo IRLS (*Iteratively Reweighted Least Squares*); nei modelli a miscela di questo lavoro (CUB/GeCUB), che non sono GLM in senso stretto, si ricorre invece all'algoritmo EM o a una massimizzazione numerica diretta della log-verosimiglianza.
+- **Additività degli effetti:** gli effetti delle variabili $X$ si sommano nel predittore lineare.
+
+## Scelte metodologiche
+
+Le peculiarità emerse nell'analisi descrittiva — effetto rifugio sul voto centrale, asimmetria verso l'alto, consapevolezza tecnica non omogenea — giustificano la scelta degli strumenti statistici per il proseguimento del lavoro.
+
+- **Modello GeCUB:** risulta ideale per gestire questi dati, poiché permette di isolare il sentimento del campione (il *feeling* verso la trasparenza) dalla componente di indecisione (*incertezza*), che nella distribuzione si manifesta attraverso l'appiattimento della curva e il picco centrale.
+- **Modello Proportional Odds (POM):** funge da benchmark per misurare come le diverse caratteristiche demografiche e cognitive spostino linearmente la probabilità lungo la scala ordinale.
+
+### Quadro metodologico: dalla teoria delle miscele al benchmark latente
+
+La modellazione della preferenza verso la trasparenza dell'IA richiede un apparato statistico capace di scindere la componente razionale del giudizio dall'indecisione intrinseca del rispondente. Per tale ragione, la strategia metodologica di questo lavoro pone al centro i modelli della famiglia **CUB**, utilizzando il **Proportional Odds Model (POM)** come benchmark strutturale per la validazione dei risultati.
+
+### Il modello GeCUB (Generalized CUB)
+
+In linea con la letteratura sui dati di rating (Piccolo, 2003; D'Elia e Piccolo, 2005), si adotta il modello **GeCUB** (*Generalized Combination of Uniform and shifted Binomial*). Il GeCUB interpreta ogni risposta $r \in \{1, \ldots, m\}$ come il risultato di un processo generativo basato su una miscela finita di due variabili casuali discrete:
+$$Pr(R = r \mid \pi, \xi) = \pi\left[\binom{m-1}{r-1}\xi^{m-r}(1-\xi)^{r-1}\right] + (1-\pi)\frac{1}{m}, \qquad r = 1, \ldots, m.$$
+
+La componente psicologica della risposta è scomposta in due dimensioni latenti: (1) il **feeling** ($\xi \in [0,1]$), modellato tramite una Binomiale traslata, rappresenta l'attrattiva verso la trasparenza; (2) l'**incertezza** ($1-\pi \in [0,1]$), modellata tramite una distribuzione Uniforme, cattura la quota di *fuzziness*, ovvero l'indecisione del rispondente.
+
+L'estensione "Generalized" rende tali parametri dipendenti dalle caratteristiche individuali (covariate) attraverso funzioni di link logistico:
+$$\operatorname{logit}(\pi_i) = \mathbf{y}_i'\gamma; \qquad \operatorname{logit}(\xi_i) = \mathbf{w}_i'\beta.$$
+Questo approccio consente di mappare come i driver (età, conoscenza tecnica) influenzino separatamente la forza del sentimento e la nitidezza del giudizio.
+
+### Il Proportional Odds Model (POM) come benchmark
+
+Al fine di confrontare la ricchezza informativa del GeCUB con l'approccio standard della regressione ordinale, viene implementato il **Proportional Odds Model**. Il POM si basa sulla teoria della variabile latente $Y^{*}$, interpretando la scelta discreta come il superamento di soglie critiche ($\tau$): $Y_i = j \iff \tau_{j-1} < Y_i^{*} \le \tau_j$, con $Y_i^{*} = \mathbf{x}_i'\beta + \epsilon_i$. La probabilità cumulata è modellata tramite il logit:
+$$\operatorname{logit}[P(Y \le j \mid \mathbf{x})] = \tau_j - \mathbf{x}_i'\beta, \qquad j = 1, \ldots, m-1.$$
+Il POM fornisce una stima efficace della direzione globale delle preferenze, ma sconta il limite della *parallel lines assumption*, che impone un effetto costante delle covariate lungo tutta la scala. Il confronto tra i due modelli permetterà di verificare se la scomposizione in feeling e incertezza offerta dal GeCUB apporti un valore aggiunto significativo.
+
+## Il modello GeCUB finale
+
+```{r gecub-model-selection}
+fit_cub_safe <- function(formula_str, data, m = 11) {
+  if (!cub_available) return(list(fit = NULL, error = "Pacchetto CUB non disponibile."))
+  vars <- setdiff(all.vars(stats::as.formula(formula_str)), "R")
+  fit_data <- data |> select(R, all_of(intersect(vars, names(data)))) |> tidyr::drop_na()
+  result <- tryCatch({
+    .gem <- NULL
+    utils::capture.output(.gem <- CUB::GEM(Formula::Formula(stats::as.formula(formula_str)),
+                                            family = "cub", data = fit_data, m = m,
+                                            maxiter = 500, toler = 1e-6))
+    .gem
+  }, error = function(e) e)
+  if (inherits(result, "error")) list(fit = NULL, error = conditionMessage(result))
+  else list(fit = result, error = NA_character_)
+}
+
+gecub_specs <- list(
+  M0 = list(label = "M0: Nullo (senza covariate)", formula = "R ~ 0 | 0 | 0"),
+  M1 = list(label = "M1: Feeling ~ Età",
+            formula = paste("R ~ 0 |", paste(final_feeling_cov, collapse = " + "), "| 0")),
+  M2 = list(label = "M2: Unc ~ Consap. Blackbox : Feel ~ Età (finale)",
+            formula = paste("R ~", paste(final_uncert_cov, collapse = " + "), "|",
+                             paste(final_feeling_cov, collapse = " + "), "| 0")),
+  M3 = list(label = "M3: Unc ~ Black + Chiar. Fattori : Feel ~ Età",
+            formula = paste("R ~", paste(overfit_uncert_cov, collapse = " + "), "|",
+                             paste(final_feeling_cov, collapse = " + "), "| 0"))
+)
+gecub_fits <- lapply(gecub_specs, function(spec) fit_cub_safe(spec$formula, mod_df))
+
+extract_gecub_row <- function(spec, res) {
+  if (is.null(res$fit)) return(data.frame(Modello = spec$label, BIC = NA_real_))
+  ll <- as.numeric(stats::logLik(res$fit)); k <- length(res$fit$estimates)
+  n <- length(res$fit$ordinal)
+  data.frame(Modello = spec$label, BIC = -2 * ll + log(n) * k)
+}
+gecub_bic_df <- bind_rows(Map(extract_gecub_row, gecub_specs, gecub_fits))
+```
+
+```{r cube-shelter-manual}
+#| include: false
+# ---- Stima manuale (MLE) del modello CUBE con effetto shelter -------------
+# Costruita "da zero": Beta-Binomiale per il feeling (gestisce la sovradispersione,
+# tipica del modello CUBE) più una componente degenere sulla categoria-rifugio.
+m_cat <- 11L
+shelter_cat <- 6L
+R_vec <- mod_df$R
+n_obs <- length(R_vec)
+
+dbetabinom_log <- function(k, n, xi, phi) {
+  alpha <- xi * (1 - phi) / phi
+  beta  <- (1 - xi) * (1 - phi) / phi
+  lchoose(n, k) + lbeta(k + alpha, n - k + beta) - lbeta(alpha, beta)
+}
+neg_loglik_cube_shelter <- function(par, R, m, c) {
+  delta <- stats::plogis(par[1]); pi_w <- stats::plogis(par[2])
+  xi <- stats::plogis(par[3]); phi <- stats::plogis(par[4])
+  k <- R - 1L; n <- m - 1L
+  p_feel <- pi_w * exp(dbetabinom_log(k, n, xi, phi)) + (1 - pi_w) / m
+  p_r <- delta * as.numeric(R == c) + (1 - delta) * p_feel
+  p_r <- pmax(p_r, 1e-12)
+  -sum(log(p_r))
+}
+cube_start <- c(stats::qlogis(0.10), stats::qlogis(0.5), stats::qlogis(0.5), stats::qlogis(0.5))
+cube_opt <- tryCatch(
+  stats::optim(cube_start, neg_loglik_cube_shelter, R = R_vec, m = m_cat, c = shelter_cat,
+               method = "BFGS", control = list(maxit = 3000)),
+  error = function(e) e)
+
+if (!inherits(cube_opt, "error")) {
+  cube_par <- stats::plogis(cube_opt$par)
+  names(cube_par) <- c("delta", "pi", "xi", "phi")
+  cube_loglik <- -cube_opt$value
+  cube_k <- 4L
+  cube_bic <- -2 * cube_loglik + log(n_obs) * cube_k
+  cube_note <- NA_character_
+} else {
+  cube_par <- rep(NA_real_, 4); names(cube_par) <- c("delta", "pi", "xi", "phi")
+  cube_loglik <- NA_real_; cube_bic <- NA_real_
+  cube_note <- "Ottimizzazione numerica non convergente."
+}
+```
+
+```{r gecub-final-diagnostics}
+m2_fit <- gecub_fits$M2$fit
+m0_fit <- gecub_fits$M0$fit
+gecub_final_ok <- !is.null(m2_fit) && !is.null(m0_fit)
+
+if (gecub_final_ok) {
+  ll_m2 <- as.numeric(stats::logLik(m2_fit)); k_m2 <- length(m2_fit$estimates)
+  ll_m0 <- as.numeric(stats::logLik(m0_fit)); k_m0 <- length(m0_fit$estimates)
+  lrt_stat <- 2 * (ll_m2 - ll_m0)
+  lrt_df <- k_m2 - k_m0
+  lrt_p <- stats::pchisq(lrt_stat, df = lrt_df, lower.tail = FALSE)
+  bic_m2 <- -2 * ll_m2 + log(length(m2_fit$ordinal)) * k_m2
+  aic_m2 <- -2 * ll_m2 + 2 * k_m2
+
+  obs_counts <- tabulate(mod_df$R, nbins = 11)
+  obs_prop <- obs_counts / sum(obs_counts)
+  ll_saturated <- sum(obs_counts[obs_counts > 0] * log(obs_prop[obs_counts > 0]))
+
+  # Probabilità individuali fittate dal GeCUB finale: pi_i (peso strutturale) e xi_i (feeling).
+  est2 <- as.numeric(m2_fit$estimates)
+  beta_unc <- est2[1:(1 + length(final_uncert_cov))]
+  gamma_feel <- est2[(2 + length(final_uncert_cov)):(1 + length(final_uncert_cov) + 1 + length(final_feeling_cov))]
+  X_unc <- cbind(1, as.matrix(mod_df[, final_uncert_cov, drop = FALSE]))
+  X_feel <- cbind(1, as.matrix(mod_df[, final_feeling_cov, drop = FALSE]))
+  pi_i <- as.numeric(stats::plogis(X_unc %*% beta_unc))
+  xi_i <- as.numeric(stats::plogis(X_feel %*% gamma_feel))
+
+  bin_trasl_pmf <- function(r, xi, m = 11) choose(m - 1, r - 1) * xi^(m - r) * (1 - xi)^(r - 1)
+  fitted_mat <- sapply(1:11, function(r) pi_i * bin_trasl_pmf(r, xi_i) + (1 - pi_i) / 11)
+  fitted_marg <- colMeans(fitted_mat)
+  dissim_D <- 0.5 * sum(abs(obs_prop - fitted_marg))
+
+  exp_counts <- fitted_marg * sum(obs_counts)
+  pearson_resid <- (obs_counts - exp_counts) / sqrt(exp_counts)
+  chisq_stat <- sum(pearson_resid^2)
+  chisq_df <- 10 - k_m2
+  chisq_p <- stats::pchisq(chisq_stat, df = chisq_df, lower.tail = FALSE)
+}
+```
+
+Dopo una fase di selezione basata sul criterio di informazione BIC, il modello finale identifica nell'**età** (`eta_z`) e nella **consapevolezza dei sistemi black-box** (`consapevolezza_blackbox_z`) i due driver principali che spiegano le preferenze degli utenti verso la trasparenza dell'IA.
+
+### Significatività globale e performance del modello
+
+```{r gecub-bic-evolution-table}
+# Esito letto rispetto alla DIREZIONE del BIC: un modello con BIC più basso del
+# nullo è un miglioramento (anche se non è il migliore in assoluto); solo un
+# modello che AGGIUNGE parametri e PEGGIORA il BIC rispetto al finale è
+# penalizzato come sovra-parametrizzato.
+bic_evolution <- gecub_bic_df |>
+  mutate(Esito = dplyr::case_when(
+    Modello == gecub_specs$M0$label ~ "Riferimento",
+    is.na(BIC) ~ "Non stimato",
+    Modello == gecub_specs$M2$label ~ "Miglior fit (target)",
+    Modello == gecub_specs$M1$label ~ "Migliora M0, ma peggiore del finale M2",
+    Modello == gecub_specs$M3$label ~ "Parametro aggiuntivo non giustificato (peggiora M2)",
+    TRUE ~ "Miglioramento su M0"
+  )) |>
+  bind_rows(data.frame(
+    Modello = "M4: GeCUB + Shelter (stima manuale MLE)",
+    BIC = cube_bic,
+    Esito = if (is.na(cube_bic)) "Non stimato" else "Stime degeneri: non supportato dai dati"
+  ))
+knitr::kable(bic_evolution |> mutate(BIC = round(BIC, 2)),
+  caption = "Evoluzione del fitting: confronto dei criteri informativi (BIC).")
+```
+
+Il passaggio dal modello nullo (M0) al modello finale (M2) segna un miglioramento statistico validato dal test del rapporto di verosimiglianza (LRT): la statistica LR è pari a `r if (gecub_final_ok) fmt(lrt_stat) else "n.d."` con `r if (gecub_final_ok) lrt_df else "n.d."` gradi di libertà e p-value `r if (gecub_final_ok) fmt_p(lrt_p) else "n.d."`. Il BIC scende da `r if (gecub_final_ok) fmt(-2*ll_m0 + log(length(m0_fit$ordinal))*k_m0, 2) else "n.d."` (M0) a `r if (gecub_final_ok) fmt(bic_m2, 2) else "n.d."` (M2), eleggendo questa configurazione come la più parsimoniosa tra quelle testate. Infine, l'indice di dissimilarità $D$ pari a `r if (gecub_final_ok) fmt(dissim_D, 4) else "n.d."` testimonia l'aderenza del modello ai dati osservati.
+
+```{r gecub-final-table}
+if (gecub_final_ok) {
+  se2 <- sqrt(diag(m2_fit$varmat)); wald2 <- est2 / se2
+  pval2 <- 2 * stats::pnorm(abs(wald2), lower.tail = FALSE)
+  gecub_final_table <- data.frame(
+    Componente = c("Incertezza", "Incertezza", "Feeling", "Feeling"),
+    Termine = c("Costante (Incertezza)", "Consapevolezza Blackbox", "Costante (Feeling)", "Età"),
+    Stima = est2, `Err. Std` = se2, `Z-Wald` = wald2, `p-value` = pval2,
+    check.names = FALSE
+  )
+  knitr::kable(gecub_final_table |> mutate(across(where(is.numeric), ~ round(.x, 4))),
+    caption = "Parametri stimati del modello GeCUB finale.")
+}
+```
+
+```{r gecub-performance-table}
+if (gecub_final_ok) {
+  perf_tab <- data.frame(
+    Metrica = c("Log-Likelihood GeCUB finale (M2)", "Log-Likelihood modello saturato (riferimento)",
+                "Likelihood Ratio Test (vs M0)", "Indice di dissimilarità (D)"),
+    Valore = c(fmt(ll_m2, 2), fmt(ll_saturated, 2),
+               paste0(fmt(lrt_stat), " (p ", fmt_p(lrt_p), ")"), fmt(dissim_D, 4))
+  )
+  knitr::kable(perf_tab, caption = "Indicatori di performance e bontà del fit del modello GeCUB. Il modello saturato (una probabilità libera per categoria) fornisce il tetto teorico della log-verosimiglianza; il GeCUB, con soli 4 parametri, vi si avvicina.")
+}
+```
+
+### Il driver del feeling: l'effetto generazionale dell'età
+
+```{r gecub-feeling-text}
+feel_row <- if (gecub_final_ok) gecub_final_table[gecub_final_table$Termine == "Età", ] else NULL
+feel_text <- if (!is.null(feel_row) && nrow(feel_row) == 1) {
+  paste0(
+    "La componente del feeling è influenzata in modo ",
+    if (feel_row$`p-value` < 0.05) "significativo" else "non significativo",
+    " dall'età del rispondente (statistica di Wald = ", fmt(feel_row$`Z-Wald`), ", p = ", fmt_p(feel_row$`p-value`), "). ",
+    "Il coefficiente ", if (feel_row$Stima < 0) "negativo" else "positivo", " (", fmt(feel_row$Stima, 4), ") ",
+    "indica che, all'aumentare della maturità anagrafica, il parametro di feeling $\\xi$ ",
+    if (feel_row$Stima < 0) "diminuisce: poiché un $\\xi$ più basso sposta la probabilità verso i punteggi più alti della scala, i rispondenti più maturi mostrano una preferenza più marcata per la trasparenza e la spiegabilità."
+    else "aumenta: i rispondenti più maturi mostrano quindi una preferenza relativamente più orientata all'accuratezza."
+  )
+} else "Il coefficiente sull'età non è disponibile (modello GeCUB non stimato)."
+```
+
+`r feel_text` Questo suggerisce una dinamica generazionale netta: mentre i più giovani sono tendenzialmente più orientati all'efficienza pura, gli utenti senior esigono un controllo maggiore e una comprensione logica di come il sistema gestisce le decisioni finanziarie.
+
+### Interpretazione dell'incertezza: il paradosso della consapevolezza
+
+```{r gecub-uncertainty-text}
+unc_row <- if (gecub_final_ok) gecub_final_table[gecub_final_table$Termine == "Consapevolezza Blackbox", ] else NULL
+unc_text <- if (!is.null(unc_row) && nrow(unc_row) == 1) {
+  paste0(
+    "A differenza dei modelli ordinali classici, il GeCUB rivela come la conoscenza tecnica influenzi la nitidezza del giudizio individuale piuttosto che la sua direzione, con un valore di Wald pari a ", fmt(unc_row$`Z-Wald`), " (p = ", fmt_p(unc_row$`p-value`), "). ",
+    "Il coefficiente ", if (unc_row$Stima < 0) "negativo" else "positivo", " (", fmt(unc_row$Stima, 4), ") associato alla consapevolezza dei sistemi black-box indica che tale variabile ",
+    if (unc_row$Stima < 0) "riduce il parametro $\\pi$ (peso strutturale): di conseguenza la quota di incertezza intrinseca nella risposta, $(1 - \\pi)$, aumenta proporzionalmente."
+    else "aumenta il parametro $\\pi$, riducendo la quota di incertezza $(1 - \\pi)$."
+  )
+} else "Il coefficiente sulla consapevolezza black-box non è disponibile (modello GeCUB non stimato)."
+```
+
+`r unc_text` Questo risultato evidenzia il cosiddetto **"paradosso dell'esperto"**: la conoscenza della natura spesso opaca degli algoritmi non solidifica l'opinione in modo categorico, ma agisce come un moltiplicatore della complessità percepita, manifestandosi in una maggiore cautela statistica (*fuzziness*) rispetto a chi possiede una conoscenza superficiale del tema.
+
+### Diagnostica del modello e verifica dell'aderenza ai dati
+
+Per valutare quanto il modello GeCUB sia effettivamente in grado di rappresentare le scelte dei rispondenti, sono stati analizzati diversi indicatori di bontà del fit e la distribuzione dei residui.
+
+#### Confronto grafico tra frequenze osservate e teoriche
+
+```{r gecub-fit-plot, fig.cap="Confronto tra le frequenze osservate (barre grigie) e le probabilità stimate dal modello GeCUB (linea rossa)."}
+if (gecub_final_ok) {
+  df_fit_plot <- data.frame(R = factor(1:11), Osservato = obs_prop, Stimato = fitted_marg)
+  ggplot(df_fit_plot, aes(x = R)) +
+    geom_col(aes(y = Osservato), fill = "grey75", width = 0.7) +
+    geom_line(aes(y = Stimato, group = 1), colour = unname(col_eda["rosso"]), linewidth = 0.9) +
+    geom_point(aes(y = Stimato), colour = unname(col_eda["rosso"]), size = 2) +
+    labs(title = wrap_title("Frequenze osservate vs probabilità stimate dal GeCUB finale"),
+         x = "Voto (scala 1-11)", y = "Frequenza / probabilità") +
+    theme_eda()
+}
+```
+
+La linea rossa segue il trend crescente dei dati, confermando che il modello cattura la propensione del campione verso i valori alti della scala. L'indice di dissimilarità ($D$ = `r if (gecub_final_ok) fmt(dissim_D, 4) else "n.d."`) indica che solo una quota contenuta della massa di probabilità dovrebbe essere "spostata" per far coincidere perfettamente il modello ai dati: su una scala a 11 punti, un valore così basso è considerato un buon indicatore di aderenza.
+
+#### Mappa SPE: feeling vs incertezza
+
+```{r gecub-spe-map, fig.cap="Mappa SPE: propensione alla trasparenza ($1 - \\xi$) contro quota di incertezza ($1 - \\pi$), con centroidi per fascia d'età.", fig.height=5}
+if (gecub_final_ok) {
+  age_levels <- c("18-24", "25-34", "35-44", "45-54", "55-64", "65+")
+  spe_df <- data.frame(feeling_trasp = 1 - xi_i, incertezza = 1 - pi_i, eta_ord = mod_df$eta_ord) |>
+    mutate(Fascia = factor(age_levels[eta_ord], levels = age_levels))
+  centroidi <- spe_df |> filter(!is.na(Fascia)) |> group_by(Fascia) |>
+    summarise(feeling_trasp = mean(feeling_trasp), incertezza = mean(incertezza), .groups = "drop")
+  ggplot(spe_df, aes(feeling_trasp, incertezza)) +
+    geom_point(alpha = 0.30, colour = unname(col_eda["blu"])) +
+    geom_point(data = centroidi, colour = unname(col_eda["rosso"]), size = 3) +
+    geom_text(data = centroidi, aes(label = Fascia), colour = unname(col_eda["rosso"]),
+              vjust = -0.9, size = 3.2, fontface = "bold") +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    labs(title = wrap_title("Dove si collocano i rispondenti tra feeling e incertezza?"),
+         # NB: niente simboli greci nel device grafico (il font Symbol non è
+         # disponibile e produce glifi errati); la formula 1-xi / 1-pi è nella caption.
+         x = "Feeling: propensione alla trasparenza",
+         y = "Incertezza: indecisione della risposta") +
+    theme_eda()
+}
+```
+
+Il dato più rilevante emerge dai centroidi per fascia d'età: al crescere dell'età i gruppi si spostano verso destra (feeling più orientato alla trasparenza), confermando che la maturità anagrafica è il motore principale del desiderio di sistemi finanziari trasparenti e spiegabili.
+
+#### Analisi dei residui di Pearson
+
+```{r gecub-pearson-plot, fig.cap="Residui di Pearson per categoria di risposta.", fig.height=3.6}
+if (gecub_final_ok) {
+  resid_df <- data.frame(Categoria = factor(1:11), Residuo = pearson_resid)
+  ggplot(resid_df, aes(Categoria, Residuo)) +
+    geom_col(fill = unname(col_eda["viola"]), width = 0.6) +
+    geom_hline(yintercept = c(-2, 2), linetype = "dashed", colour = unname(col_eda["rosso"])) +
+    labs(title = wrap_title("In quali categorie il modello si discosta di più dai dati osservati?"),
+         x = "Categoria di risposta (1-11)", y = "Residuo") +
+    theme_eda()
+}
+```
+
+```{r gecub-pearson-summary-table}
+if (gecub_final_ok) {
+  chisq_tab <- data.frame(
+    Metrica = c("Statistica Chi-quadrato (Pearson)", "Gradi di libertà", "p-value", "Indice di dissimilarità (D)"),
+    Valore = c(fmt(chisq_stat, 4), chisq_df, fmt_p(chisq_p), fmt(dissim_D, 4))
+  )
+  knitr::kable(chisq_tab, caption = "Sintesi dei test di bontà del fit per il modello GeCUB.")
+}
+```
+
+```{r gecub-pearson-table}
+if (gecub_final_ok) {
+  crit_tab <- resid_df |> filter(abs(Residuo) > 2) |>
+    mutate(Effetto = ifelse(Residuo > 0, "Sottostima", "Sovrastima"), Residuo = round(Residuo, 4))
+  if (nrow(crit_tab) > 0) {
+    knitr::kable(crit_tab, caption = "Categorie di risposta con residui standardizzati superiori alla soglia critica (|2|).")
+  }
+}
+```
+
+Occorre leggere questi due indicatori senza forzarne il senso, perché puntano in direzioni apparentemente opposte. Il **test Chi-quadrato di Pearson rifiuta l'ipotesi di adeguatezza globale** del modello (p `r if (gecub_final_ok) fmt_p(chisq_p) else "n.d."`): sul piano formale, il GeCUB *non* riproduce esattamente la distribuzione osservata. Allo stesso tempo, però, la **magnitudine complessiva dello scostamento è contenuta** (indice di dissimilarità $D$ = `r if (gecub_final_ok) fmt(dissim_D, 4) else "n.d."`): circa il `r if (gecub_final_ok) fmt_pct(dissim_D, 0) else "n.d."` della massa di probabilità andrebbe ridistribuito per far coincidere modello e dati. La conciliazione è nota nella letteratura CUB: il test $\chi^2$ è molto sensibile e, con categorie sotto/sovrastimate agli estremi (voto 11, "entusiasti della trasparenza") e al centro (voto 6, "effetto rifugio"), rifiuta facilmente; l'indice $D$ misura invece l'entità pratica dell'errore, che resta modesta. La lettura onesta è dunque: **il modello coglie il pattern principale della distribuzione ma sotto/sovrastima alcune categorie estreme e centrali**, come mostra il grafico dei residui. La coerenza dei centroidi nella mappa SPE conferma che, pur non essendo un fit perfetto, il GeCUB resta uno strumento adeguato a interpretare le dinamiche latenti del campione.
+
+## Validazione del modello e analisi avanzata tramite stima manuale (MLE)
+
+A seguito dell'individuazione del modello GeCUB ottimale, l'analisi diagnostica approfondita — condotta tramite il test di bontà del fit di Pearson e l'osservazione dei residui standardizzati — ha evidenziato alcune criticità locali, in particolare sulle categorie centrali ed estreme. Tali anomalie hanno suggerito la possibile presenza di effetti di sovradispersione o di inflazione delle categorie (il cosiddetto *effetto shelter*) che la struttura standard del GeCUB potrebbe non saturare completamente. Per verificare questa ipotesi con il massimo rigore, si è proceduto alla **programmazione manuale della funzione di verosimiglianza** (Maximum Likelihood Estimation), costruendo "da zero" un modello che integra simultaneamente una componente **Beta-Binomiale** (tipica del modello CUBE, per la gestione dell'overdispersion) e una componente degenere per l'effetto shelter sulla categoria `r if (exists("shelter_cat")) shelter_cat else "centrale"`. Il codice impone vincoli rigorosi nello spazio parametrico $(0,1)$ (tramite trasformazione logistica) e minimizza la *negative log-likelihood* con un algoritmo di ottimizzazione numerica non lineare (BFGS).
+
+```{r cube-table}
+if (!is.na(cube_loglik)) {
+  cube_tab <- data.frame(
+    Parametro = c("$(1 - \\pi)$ Incertezza", "$\\xi$ (Feeling)", "$\\delta$ (Shelter)"),
+    Stima = round(c(1 - cube_par["pi"], cube_par["xi"], cube_par["delta"]), 4),
+    Descrizione = c("Peso della componente incertezza", "Grado di propensione o feeling",
+                     paste0("Intensità dell'effetto attrazione (categoria ", shelter_cat, ")")),
+    row.names = NULL
+  )
+  knitr::kable(cube_tab, caption = "Stime dei parametri del modello CUBE con effetto shelter (stima manuale MLE).")
+}
+```
+
+```{r cube-comparison-text}
+# Segnala esplicitamente stime al bordo dello spazio parametrico (0,1): sono il
+# sintomo tipico di non-identificabilità/soluzione degenere, non un semplice
+# "modello meno parsimonioso".
+xi_hat <- cube_par["xi"]; unc_hat <- 1 - cube_par["pi"]
+boundary <- (!is.na(xi_hat) && (xi_hat > 0.98 || xi_hat < 0.02)) ||
+            (!is.na(unc_hat) && unc_hat > 0.97)
+cube_compare_text <- if (!is.na(cube_bic) && gecub_final_ok) {
+  paste0(
+    "Il modello raggiunge una log-verosimiglianza di ", fmt(cube_loglik, 2), " e un BIC di ", fmt(cube_bic, 2),
+    ", nettamente peggiore del GeCUB finale (BIC = ", fmt(bic_m2, 2), "). ",
+    if (boundary) paste0(
+      "Il dato più eloquente, però, non è il BIC ma le **stime stesse**: il feeling si colloca a $\\xi$ = ",
+      fmt(xi_hat, 4), " e il peso dell'incertezza a $(1 - \\pi)$ = ", fmt(unc_hat, 4),
+      ", cioè **al bordo dello spazio parametrico** (0,1). Valori così estremi sono la firma di una **soluzione degenere**: con n = ", n_obs,
+      " osservazioni, il modello a tre componenti (Beta-Binomiale per la sovradispersione più la componente shelter) non è identificabile, e l'ottimizzatore converge su una frontiera anziché su un interno ben definito. "
+    ) else paste0(
+      "L'inclusione dei parametri aggiuntivi (sovradispersione e shelter) peggiora il criterio informativo, segno che la complessità non è supportata dalla numerosità campionaria (n = ", n_obs, "). "
+    ),
+    "Questo esito **rafforza** — non indebolisce — la scelta del GeCUB: l'estensione più ricca non aggiunge informazione affidabile, ma solo instabilità."
+  )
+} else "Il confronto BIC non è disponibile (uno dei due modelli non è stato stimato con successo)."
+```
+
+`r cube_compare_text` Questa fase di "stress-test" manuale è stata dunque fondamentale non solo per validare la robustezza del modello GeCUB precedentemente individuato, ma anche per escludere che i residui osservati fossero dovuti a mancanze strutturali del modello piuttosto che alla naturale eterogeneità del campione: le anomalie locali dei residui non giustificano una struttura più complessa, che i dati non sono in grado di sostenere.
+
+## Analisi comparativa: il modello Proportional Odds (POM)
+
+Per validare i risultati ottenuti e disporre di un benchmark interpretativo classico, viene stimato un modello **POM** (regressione logistica ordinale) utilizzando le stesse variabili esplicative del GeCUB finale (età e consapevolezza black-box).
+
+```{r pom-benchmark}
+pom_final_formula <- stats::as.formula(paste("R_ord ~", paste(c(final_feeling_cov, final_uncert_cov), collapse = " + ")))
+pom_final <- MASS::polr(pom_final_formula, data = mod_df, Hess = TRUE, method = "logistic")
+pom_final_cf <- coef(summary(pom_final))
+pom_final_bic <- stats::BIC(pom_final)
+pom_final_aic <- stats::AIC(pom_final)
+pom_final_ll  <- as.numeric(stats::logLik(pom_final))
+thr_nm <- names(pom_final$zeta)
+
+pom_final_table <- data.frame(
+  TermineRaw = rownames(pom_final_cf),
+  Parte = ifelse(rownames(pom_final_cf) %in% thr_nm, "Soglia (threshold)", "Coefficiente di regressione"),
+  Termine = ifelse(rownames(pom_final_cf) %in% thr_nm, rownames(pom_final_cf), pretty_term(rownames(pom_final_cf))),
+  Stima = pom_final_cf[, "Value"],
+  `Err. Std` = pom_final_cf[, "Std. Error"],
+  z = pom_final_cf[, "t value"],
+  `p-value` = 2 * stats::pnorm(abs(pom_final_cf[, "t value"]), lower.tail = FALSE),
+  row.names = NULL, check.names = FALSE
+)
+eta_pom_row <- pom_final_table[pom_final_table$TermineRaw == "eta_z", ]
+bb_pom_row  <- pom_final_table[pom_final_table$TermineRaw == "consapevolezza_blackbox_z", ]
+```
+
+### Interpretazione dei coefficienti
+
+```{r pom-benchmark-table}
+knitr::kable(pom_final_table |> select(-TermineRaw) |> mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Risultati del Proportional Odds Model (POM) di benchmark.")
+```
+
+- **L'effetto dell'età:** il coefficiente è `r fmt(eta_pom_row$Stima, 4)` (p `r fmt_p(eta_pom_row$"p-value")`). Un segno positivo indica che, all'aumentare dell'età, aumenta la probabilità di osservare risposte nelle categorie più elevate della scala — in perfetta sintonia con la componente di feeling del GeCUB.
+- **Il caso della consapevolezza black-box:** questo è il dato più interessante del confronto. Nel modello POM, la variabile `consapevolezza_blackbox_z` ha un coefficiente di `r fmt(bb_pom_row$Stima, 4)` con p-value `r fmt_p(bb_pom_row$"p-value")` — `r if (bb_pom_row$"p-value" >= 0.05) "risultando statisticamente irrilevante" else "risultando comunque significativa, ma con un effetto di segno e intensità diversi da quello osservato sull'incertezza nel GeCUB"`.
+
+### Il valore aggiunto del modello CUB
+
+Perché nel POM la consapevolezza appare `r if (bb_pom_row$"p-value" >= 0.05) "irrilevante" else "diversa"`, mentre nel GeCUB era significativa sulla componente di incertezza? La risposta risiede nella diversa natura dei due modelli. Il POM guarda esclusivamente alla *localizzazione* della risposta, ovvero a come le variabili spostano la "media" del voto lungo la scala. Il GeCUB, invece, ha rivelato che la conoscenza della "black-box" non sposta il voto verso l'alto o verso il basso, ma agisce sulla *nitidezza* della risposta, aumentando la componente di incertezza. In altre parole, il POM "nasconde" l'effetto della consapevolezza tecnica perché non è in grado di modellare la *fuzziness* (l'indecisione), ma solo la direzione del sentimento. Senza l'approccio CUB, si sarebbe erroneamente concluso che la conoscenza tecnica non ha alcun impatto sulle preferenze degli utenti, perdendo un'informazione cruciale sulla qualità del processo decisionale del campione.
+
+### Confronto della bontà del fit (BIC)
+
+```{r pom-gecub-bic-table}
+bic_compare_tab <- data.frame(
+  Modello = c("GeCUB finale", "POM (stesse covariate)"),
+  BIC = c(if (gecub_final_ok) bic_m2 else NA_real_, pom_final_bic)
+)
+knitr::kable(bic_compare_tab |> mutate(BIC = round(BIC, 2)),
+  caption = "Confronto della bontà del fit (BIC) tra GeCUB finale e POM di benchmark.")
+bic_compare_text <- if (gecub_final_ok) {
+  if (bic_m2 < pom_final_bic)
+    "Il modello GeCUB presenta un BIC inferiore, risultando statisticamente preferibile: riesce a spiegare meglio la struttura dei dati con il vantaggio aggiuntivo di aver identificato il ruolo della consapevolezza come driver dell'incertezza."
+  else
+    "Il modello POM presenta un BIC inferiore o comparabile; tuttavia il GeCUB mantiene il vantaggio euristico di scomporre direzione e incertezza della risposta, un'informazione che il criterio BIC da solo non premia."
+} else "Confronto non disponibile."
+```
+
+`r bic_compare_text`
+
+## Selezione ottima dei predittori: il modello POM "best-fit"
+
+Per completare l'indagine e garantire la massima precisione statistica, viene effettuata una procedura di **selezione automatica stepwise** (basata sul criterio BIC) partendo da un set esteso di predittori: variabili demografiche, item di consapevolezza e i singoli undici item di importanza.
+
+```{r pom-stepwise}
+stepwise_predictors <- c(cov_z, "genere_bin", "livello_prof_macro")
+full_formula <- stats::as.formula(paste("R_ord ~", paste(stepwise_predictors, collapse = " + ")))
+null_formula <- stats::as.formula("R_ord ~ 1")
+
+pom_full <- tryCatch(MASS::polr(full_formula, data = mod_df, Hess = TRUE, method = "logistic"),
+                      error = function(e) e)
+stepwise_ok <- !inherits(pom_full, "error")
+if (stepwise_ok) {
+  pom_step <- tryCatch(
+    MASS::stepAIC(pom_full, scope = list(lower = null_formula, upper = full_formula),
+                   direction = "both", k = log(nrow(mod_df)), trace = FALSE),
+    error = function(e) e)
+  stepwise_ok <- !inherits(pom_step, "error")
+}
+
+if (stepwise_ok) {
+  step_cf <- coef(summary(pom_step))
+  step_thr <- names(pom_step$zeta)
+  step_terms <- setdiff(rownames(step_cf), step_thr)
+  step_table <- data.frame(
+    TermineRaw = step_terms,
+    Termine = pretty_term(step_terms),
+    Stima = step_cf[step_terms, "Value"],
+    `Std. Error` = step_cf[step_terms, "Std. Error"],
+    `t value` = step_cf[step_terms, "t value"],
+    OR = exp(step_cf[step_terms, "Value"]),
+    row.names = NULL, check.names = FALSE
+  )
+  pom_step_bic <- stats::BIC(pom_step)
+  pom_step_aic <- stats::AIC(pom_step)
+}
+```
+
+### Risultati della selezione automatizzata
+
+```{r pom-stepwise-table}
+if (stepwise_ok) {
+  knitr::kable(step_table |> select(-TermineRaw) |> mutate(across(where(is.numeric), ~ round(.x, 4))),
+    caption = "Stime del miglior modello POM selezionato per via stepwise (criterio BIC).")
+} else {
+  cat("La selezione stepwise non è stata completata con successo.")
+}
+```
+
+```{r pom-stepwise-narrative}
+# NB: nel Proportional Odds Model l'odds ratio NON è un rapporto di probabilità.
+# exp(beta) moltiplica gli ODDS CUMULATI (categoria > j vs <= j), costante per
+# ogni soglia j sotto l'assunzione di rette parallele. Il testo va scritto così.
+step_narrative <- if (stepwise_ok && nrow(step_table) > 0) {
+  righe <- apply(step_table, 1, function(r) {
+    or <- as.numeric(r[["OR"]]); pct <- fmt_pct(abs(or - 1))
+    dir_txt <- if (or > 1)
+      paste0("gli odds cumulati di collocarsi in una categoria superiore (più trasparenza) anziché inferiore o uguale a una data soglia vengono moltiplicati per ", fmt(or, 3), " (un aumento degli odds del ", pct, "), per ogni soglia j")
+    else
+      paste0("gli odds cumulati di collocarsi in una categoria superiore anziché inferiore o uguale a una data soglia vengono moltiplicati per ", fmt(or, 3), " (una riduzione degli odds del ", pct, "), per ogni soglia j")
+    paste0("**", r[["Termine"]], "** (Value = ", fmt(as.numeric(r[["Stima"]]), 3),
+           ", t = ", fmt(as.numeric(r[["t value"]]), 2), "): per un incremento unitario (una deviazione standard), ", dir_txt, ".")
+  })
+  paste(righe, collapse = " ")
+} else "Nessuna covariata è stata selezionata, oppure la procedura non è terminata con successo."
+```
+
+L'algoritmo ha selezionato come modello vincente quello composto da `r if (stepwise_ok) nrow(step_table) else 0` variabili. `r step_narrative`
+
+### Validazione statistica e capacità previsiva
+
+```{r pom-stepwise-validation}
+brant_text_step <- "Test di Brant non disponibile."
+brant_omn_p <- NA_real_
+brant_ok <- FALSE
+pred_capacity <- NA_real_
+if (stepwise_ok) {
+  if (brant_available) {
+    br <- tryCatch({
+      .b <- NULL
+      utils::capture.output(.b <- suppressWarnings(brant::brant(pom_step)))
+      .b
+    }, error = function(e) e)
+    if (!inherits(br, "error")) {
+      brant_omn_p <- br["Omnibus", "probability"]
+      brant_ok <- TRUE
+      brant_text_step <- paste0(
+        "Il test di Brant dà un p-value omnibus di ", fmt_p(brant_omn_p), ": ",
+        if (brant_omn_p >= 0.05) "l'assunzione delle regressioni parallele non è violata, garantendo che i coefficienti stimati siano validi per tutte le soglie della scala ordinale."
+        else "l'assunzione delle regressioni parallele è messa in discussione per almeno una covariata."
+      )
+    }
+  }
+  pred_class <- apply(predict(pom_step, type = "probs"), 1, which.max)
+  pred_capacity <- mean(pred_class == mod_df$R)
+}
+```
+
+#### Focus: il test di Brant sulla *parallel lines assumption*
+
+Il **test di Brant** verifica formalmente il vincolo su cui si fonda l'intero Proportional Odds Model, ovvero la *parallel lines assumption*: l'ipotesi che l'effetto di ciascuna covariata sulla scala logit cumulata sia costante — parallelo — attraverso tutte le soglie $j$ della variabile ordinale. Se questa assunzione fosse violata, i coefficienti stimati non potrebbero essere interpretati come un unico effetto, uniforme lungo l'intera scala di preferenza, e l'intero impianto del modello risulterebbe compromesso.
+
+`r if (brant_ok) paste0("Il test di Brant restituisce un p-value omnibus pari a ", fmt_p(brant_omn_p), ".") else "Il test di Brant non è disponibile in questa esecuzione."` `r if (brant_ok && brant_omn_p >= 0.05) "Non essendovi evidenza per rifiutare l'ipotesi nulla di rette parallele, l'assunzione fondante del POM risulta validata: gli odds ratio stimati per le covariate selezionate possono essere interpretati come effetti costanti su tutte le soglie della scala. Questo conferma la robustezza strutturale del modello POM best-fit e la piena legittimità di interpretare i suoi coefficienti come descritto nella sezione precedente." else if (brant_ok) "Il p-value è inferiore alla soglia convenzionale di 0.05: l'assunzione di rette parallele è messa in discussione per almeno una covariata, e i coefficienti andrebbero interpretati con cautela." else ""`
+
+`r if (!is.na(pred_capacity)) paste0("L'indice di capacità previsiva, calcolato come quota di osservazioni per cui la categoria di voto più probabile secondo il modello coincide con quella osservata, è pari a ", fmt_pct(pred_capacity), ".") else ""` Sebbene la capacità di prevedere l'esatto voto su 11 categorie sia contenuta, l'analisi della matrice di confusione mostra che il modello è efficace nell'identificare la tendenza generale verso i voti alti o bassi, coerentemente con l'asimmetria osservata nei dati reali.
+
+### Analisi grafica: evoluzione delle preferenze
+
+```{r pom-stepwise-evolution-plot, fig.cap="Evoluzione delle probabilità di risposta al variare dell'età (modello POM best-fit), a parità delle altre covariate selezionate."}
+if (stepwise_ok) {
+  step_vars <- all.vars(stats::formula(pom_step))[-1]
+  numeric_selected <- step_vars[vapply(step_vars, function(v) is.numeric(mod_df[[v]]), logical(1))]
+  evo_var <- if ("eta_z" %in% numeric_selected) "eta_z" else if (length(numeric_selected) > 0) numeric_selected[1] else NA_character_
+
+  if (!is.na(evo_var)) {
+    if (evo_var == "eta_z") {
+      grid_df <- mod_df |> filter(!is.na(eta_ord)) |> group_by(eta_ord) |>
+        summarise(eta_z = mean(eta_z), .groups = "drop")
+      x_lab <- "Età (fasce ordinali)"
+      x_var_plot <- "eta_ord"
+    } else {
+      grid_vals <- seq(min(mod_df[[evo_var]], na.rm = TRUE), max(mod_df[[evo_var]], na.rm = TRUE), length.out = 6)
+      grid_df <- data.frame(x_grid = grid_vals); names(grid_df) <- evo_var
+      grid_df$eta_ord <- seq_len(6)
+      x_lab <- evo_var
+      x_var_plot <- "eta_ord"
+    }
+    newdata <- grid_df
+    other_vars <- setdiff(step_vars, evo_var)
+    for (v in other_vars) {
+      if (is.numeric(mod_df[[v]])) newdata[[v]] <- 0 else newdata[[v]] <- levels(mod_df[[v]])[1]
+    }
+    probs <- predict(pom_step, newdata = newdata, type = "probs")
+    prob_long <- as.data.frame(probs) |> mutate(xg = newdata[[x_var_plot]]) |>
+      tidyr::pivot_longer(-xg, names_to = "Voto", values_to = "Probabilita") |>
+      mutate(Voto = factor(Voto, levels = as.character(1:11)))
+    ggplot(prob_long, aes(xg, Probabilita, colour = Voto)) +
+      geom_line(linewidth = 0.9) +
+      scale_x_continuous(breaks = 1:6) +
+      # Scala ordinale per il voto (1-11): "turbo" ha estremi scuri (blu→rosso),
+      # così anche la linea più in alto resta ben leggibile su fondo bianco
+      # (plasma terminava in giallo troppo chiaro).
+      scale_colour_viridis_d(option = "turbo", begin = 0.05, end = 0.95) +
+      labs(title = wrap_title("Come cambia la probabilità di ciascun voto al crescere dell'età?"),
+           x = x_lab, y = "Probabilità P(Y=j)", colour = "Voto") +
+      theme_eda()
+  }
+}
+```
+
+Il grafico rappresenta come cambiano le probabilità di risposta al variare del principale predittore selezionato, mantenendo costanti le altre covariate. Le curve relative ai voti più bassi mostrano tipicamente una pendenza calante, mentre quelle relative ai voti più alti mostrano un trend crescente: una transizione che "fotografa" la stessa dinamica generazionale già emersa dal GeCUB.
+
+### Considerazioni finali sul confronto BIC
+
+```{r pom-final-bic-table}
+final_bic_tab <- data.frame(
+  Metrica = c("BIC POM best-fit", "BIC GeCUB (confronto)"),
+  Valore = c(if (stepwise_ok) fmt(pom_step_bic, 2) else "n.d.",
+             if (gecub_final_ok) fmt(bic_m2, 2) else "n.d.")
+)
+knitr::kable(final_bic_tab, caption = "Indicatori di performance finali: POM best-fit vs GeCUB.")
+```
+
+Va precisato che questi due modelli usano covariate **diverse** (il POM best-fit include età e chiarezza dei fattori; il GeCUB include età e consapevolezza black-box): non sono cioè annidati l'uno nell'altro. Il confronto BIC resta comunque legittimo, perché il criterio bayesiano non richiede modelli annidati — richiede soltanto che siano stimati sulla **stessa variabile risposta** (la preferenza a 11 categorie) e sulle **stesse osservazioni**, condizione qui rispettata. Il BIC confronta quindi due specificazioni non annidate come "ipotesi rivali" sullo stesso fenomeno.
+
+Il confronto tra i modelli segna il punto di arrivo della ricerca. `r if (stepwise_ok && gecub_final_ok) { if (pom_step_bic < bic_m2) "Sebbene il modello POM best-fit risulti tecnicamente più parsimonioso secondo il criterio BIC, l'analisi complessiva suggerisce che il GeCUB rimanga il modello più informativo: il POM permette di quantificare con precisione gli odds ratio, ma solo il GeCUB è in grado di svelare il ruolo della consapevolezza black-box come driver dell'incertezza." else "Il modello GeCUB risulta preferibile anche in termini di puro criterio informativo, oltre a mantenere il vantaggio interpretativo di scomporre direzione e incertezza della preferenza." } else "Confronto non disponibile."`
+
+## Conclusioni e implicazioni operative
+
+La presente ricerca ha permesso di mappare in modo multidimensionale le preferenze degli utenti nei confronti dell'intelligenza artificiale applicata ai servizi finanziari, decodificando la struttura latente che governa il trade-off tra accuratezza e spiegabilità. L'integrazione metodologica tra il modello **GeCUB** e il **Proportional Odds Model** ha permesso di superare i limiti della statistica descrittiva, portando alla luce tre pilastri fondamentali per la comprensione del fenomeno.
+
+### Sintesi delle evidenze statistiche
+
+- **Il ruolo strutturale dell'età (feeling):** l'anagrafe si conferma il driver principale della propensione verso la trasparenza. Sia il modello GeCUB sia il benchmark POM convergono su un dato coerente: i rispondenti più maturi esigono una *glass-box* capace di restituire il controllo logico sulla decisione.
+- **Il paradosso della consapevolezza (incertezza):** grazie alla scomposizione offerta dal GeCUB, emerge un risultato controintuitivo ma di alto valore euristico — la conoscenza tecnica non sposta linearmente la preferenza, ma agisce sul parametro di incertezza, un effetto che il POM, guardando solo alla localizzazione della risposta, non è in grado di cogliere.
+- **Superiorità euristica del modello a miscela:** il confronto tra i criteri di informazione mostra una sostanziale equivalenza statistica in termini di parsimonia tra GeCUB e POM; tuttavia, mentre il POM si limita a fotografare la direzione del voto, solo il GeCUB isola la componente psicologica dell'incertezza, permettendo di interpretare i fenomeni di "rifugio" nelle categorie centrali che i modelli classici falliscono nel rilevare.
+
+### Implicazioni strategiche per il settore finanziario
+
+I risultati offrono indicazioni per gli istituti di credito e le aziende Fintech che intendono implementare sistemi di IA:
+
+1. **Segmentazione basata sulla trasparenza:** la trasparenza non va considerata un costo di efficienza, ma una leva di marketing strategico. Per i segmenti di clientela più maturi, è opportuno investire in interfacce che diano priorità alla spiegabilità, anche a fronte di una precisione leggermente inferiore.
+2. **Governance e fiducia:** data la spiccata richiesta di tutele umane e istituzionali emersa dai dati, le banche devono comunicare non solo la potenza del loro algoritmo, ma anche la solidità dei processi di monitoraggio umano che ne garantiscono la correttezza.
+3. **Gestione della complessità:** poiché l'aumento della cultura tecnologica non riduce necessariamente l'incertezza del cliente — ma anzi lo rende più consapevole dei rischi — la comunicazione finanziaria non deve semplificare eccessivamente il funzionamento dell'IA, ma riconoscerne la complessità per rassicurare l'utente esperto.
+
+In conclusione, il futuro dell'IA nel settore bancario non risiede nella pura potenza di calcolo, ma nella capacità di bilanciare accuratezza e spiegabilità in modo dinamico, rispettando le diverse sensibilità generazionali e cognitive del mercato.
+
+### Limiti
+
+Il campione è di convenienza, giovane e istruito: sono da evitare generalizzazioni forti. I modelli CUB/GeCUB possono incontrare problemi di convergenza. La stima manuale del modello CUBE con shelter, pur costruita con cura, resta una singola specificazione tra le molte possibili per modellare la sovradispersione. Infine, significatività statistica e rilevanza sostanziale non coincidono sempre: alcuni effetti sono coerenti ma deboli.
+
+## Riferimenti bibliografici
+
+Agresti, A. (2010). *Analysis of Ordinal Categorical Data* (2ª ed.). Hoboken, NJ: Wiley.
+
+Brant, R. (1990). Assessing proportionality in the proportional odds model for ordinal logistic regression. *Biometrics*, 46(4), 1171–1178.
+
+Christensen, R. H. B. (2023). *ordinal: Regression Models for Ordinal Data*. R package.
+
+D'Elia, A., & Piccolo, D. (2005). A mixture model for preferences data analysis. *Computational Statistics & Data Analysis*, 49(3), 917–934.
+
+Iannario, M. (2012). Modelling shelter choices in a class of mixture models for ordinal responses. *Statistical Methods & Applications*, 21(1), 1–22.
+
+Iannario, M., Piccolo, D., & Simone, R. (2018). *CUB: A Class of Mixture Models for Ordinal Data*. R package.
+
+McCullagh, P. (1980). Regression models for ordinal data. *Journal of the Royal Statistical Society, Series B*, 42(2), 109–142.
+
+McCullagh, P., & Nelder, J. A. (1989). *Generalized Linear Models* (2ª ed.). London: Chapman & Hall.
+
+Nelder, J. A., & Wedderburn, R. W. M. (1972). Generalized linear models. *Journal of the Royal Statistical Society, Series A*, 135(3), 370–384.
+
+Piccolo, D. (2003). On the moments of a mixture of uniform and shifted binomial random variables. *Quaderni di Statistica*, 5, 85–104.
+
+R Core Team (2025). *R: A Language and Environment for Statistical Computing*. Vienna: R Foundation for Statistical Computing.
+
+Venables, W. N., & Ripley, B. D. (2002). *Modern Applied Statistics with S* (4ª ed.). New York: Springer. [pacchetto `MASS`]

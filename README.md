@@ -2,8 +2,6 @@
 
 A study of what drives people to prefer explainable ("glass-box") financial AI systems over purely accurate ("black-box") ones, using mixture models built to separate *sentiment* from *uncertainty* in survey responses.
 
-> Original title: *Trasparenza vs accuratezza nell'IA finanziaria: un'analisi con modelli CUB/GeCUB e Proportional Odds*
-
 ## Overview
 
 Financial institutions increasingly face a trade-off between AI systems that are highly accurate but opaque, and systems that are less powerful but easy to explain. This project analyzes survey data (n = 303) on how people weigh that trade-off, using an ordinal target variable (`preferenza_IA`, 0–10) where low scores favor efficiency/accuracy and high scores favor transparency.
